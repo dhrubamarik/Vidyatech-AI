@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+python-multipart
+faiss-cpu
+numpy
+sentence-transformers
+langchain-text-splitters
+groq
+pypdf
+python-docx
+reportlab
+psycopg2-binary
+alembic
+python-dotenv
