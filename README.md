@@ -1,235 +1,174 @@
-# VidyaTech AI — Updated Project
+# VidyaTech AI
 
-## Latest pass: per-user data isolation
+VidyaTech AI is a full-stack academic platform for students and faculty. It combines a personal AI study assistant (RAG over your own uploaded notes/PDFs), an adaptive planner, health/burnout tracking, faculty analytics, class communities, and AI-generated quizzes — all served from a single FastAPI backend with a single-file vanilla JS/HTML frontend.
 
-**The bug:** `rag_service.py` kept a single, process-wide FAISS index.
-Every student's uploaded documents were embedded into that *one* shared
-index, and `/agent-chat`, `/planner/recap`, `/studyhub/reverse-quiz/*`,
-and `/planner/cheatsheet` all searched it with no per-user filtering —
-so one student's questions could surface another student's private
-notes. `/documents` listed every user's files, `/clear` wiped
-everyone's knowledge base at once, and two users uploading a
-same-named file could overwrite each other's file on disk.
+## What it does
 
-**The fix:**
-- `RAGPipeline` now holds a dict of *isolated* per-scope FAISS indices
-  (`stores: Dict[scope, index]`) instead of one shared index. Every
-  retrieval/indexing call takes an explicit `scope` — in practice
-  `user:<id>` — so one person's uploads are never reachable from
-  another person's queries. This is enforced by `main.py`'s
-  `user_scope()` helper on every route that touches the knowledge base:
-  `/upload`, `/agent-chat`, `/documents` (list + delete),
-  `/planner/heatmap`, `/planner/recap`, `/planner/cheatsheet`,
-  `/studyhub/reverse-quiz/prompt` and `/evaluate`.
-- `/documents` now requires `user_id` and only returns that user's own
-  documents. `DELETE /documents/{id}` verifies the caller actually
-  uploaded that document before deleting it.
-- Uploaded files are stored on disk as `<user_id>_<filename>`, so two
-  users can't collide on the same filename.
-- `/clear` was a global "wipe everyone's knowledge base" endpoint; it's
-  now `POST /clear?user_id=` and only clears the caller's own uploads.
-- Faculty-generated quizzes (`/quizzes/generate`) draw from the
-  generating faculty member's own uploaded reference material, not a
-  shared pool.
-- Communities remain the one deliberate exception: faculty-shared
-  community notes (`/communities/{id}/notes`) are visible to every
-  member of that community, by design — that's the "unity should only
-  be within communities" behavior. `GET
-  /communities/notes/{note_id}/download` now checks the requester is
-  actually a member (or the creator) of that community first.
+**For students**
+- Upload notes/PDFs/DOCX and chat with a multi-agent AI (Tutor, Quiz Master, Summarizer) that answers strictly from *your own* uploaded material (RAG with a relevance cutoff, so off-topic questions are refused instead of hallucinated).
+- Import a syllabus and get an adaptive day-by-day study schedule (harder topics scheduled earlier, last day reserved for revision).
+- See a live syllabus heatmap (🟢/🟡/🔴 per topic) and an overall Exam Readiness score, based on how well your notes actually cover each scheduled topic.
+- Get a 60-second spoken recap of any topic (browser Web Speech API, no audio files/TTS backend).
+- Take a "reverse quiz": explain a topic in your own words and get it graded against your source material, with missing points and misconceptions called out.
+- Generate a one-page cheat sheet (definitions, formulas, likely exam questions) and export any AI response as PDF or DOCX.
+- Track burnout risk / study density from your real scheduled workload, overdue tasks, and query volume — not hardcoded labels.
+- Join faculty-created communities with a 6-digit code, receive shared tasks and notes, and take faculty-assigned quizzes.
+- Track topic mastery on a progress tree and use Career tools (skill-gap matrix, resume bullets, scholarship matching/essays).
 
-**New delete/remove options**, beyond the existing per-document delete
-and full account deletion:
-- `POST /clear?user_id=` — wipe just your uploaded documents/knowledge
-  base, without deleting your account.
-- `DELETE /chat-history/{user_id}` — clear your Study Hub chat history.
-- Both are wired up in the UI: a "Clear My Knowledge Base" button on
-  the Knowledge Base page, and a "Clear My Chat History" button on the
-  Study Hub page.
+**For faculty**
+- See department-level "doubt cluster" analytics derived from the actual text of student queries, plus resource-utilization stats.
+- Assign tasks to one student or an entire department/community.
+- Create communities, share notes (auto-summarized by AI on upload), and track member progress.
+- Generate AI-authored MCQ quizzes from a topic (grounded in your own uploaded reference material), assign them, and view per-student results.
 
-## What changed (previous pass)
+**Security/data model note:** every student's and faculty member's uploads live in their own isolated FAISS index (`scope = user:<id>`), so nobody's queries or documents are ever retrievable by another user. The one deliberate exception is community notes, which are visible to every member of that community by design.
 
-**Security fix:** `database.py` no longer has a real-looking Postgres
-password hardcoded as a default. It now falls back to a local SQLite file
-(`vidyatech.db`) if `DATABASE_URL` isn't set, so the project still runs
-out of the box, but nothing sensitive is committed. Set your real
-connection string as an environment variable instead:
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Backend | FastAPI, SQLAlchemy, Alembic |
+| Database | SQLite by default (falls back automatically), PostgreSQL supported via `DATABASE_URL` |
+| Vector search | FAISS (`faiss-cpu`) + `sentence-transformers` (`all-MiniLM-L6-v2`) |
+| LLM | Groq API (`openai/gpt-oss-120b`) |
+| Document parsing | `pypdf`, `python-docx` |
+| Export | `reportlab` (PDF), `python-docx` (DOCX) |
+| Frontend | Single-file `index.html` — vanilla JS, Chart.js, marked.js + DOMPurify (Markdown), KaTeX (math rendering). No build step. |
+
+## Prerequisites
+
+- **Python 3.10+** and `pip`
+- A free **Groq API key** — sign up at [console.groq.com](https://console.groq.com) and create a key. This powers every AI feature (chat agents, quiz generation, summaries, grading, community note summaries).
+- SQLite needs no setup and is used by default. PostgreSQL is optional (see below).
+
+## Setup — running it locally
+
+**1. Get the project into a folder and open a terminal there.**
 
 ```bash
-export DATABASE_URL="postgresql://user:password@localhost:5432/vidyatech_db"
+cd Test4.0
 ```
 
-Do the same for your Groq key:
+**2. Create and activate a virtual environment** (recommended so this project's packages don't clash with anything else on your machine).
 
 ```bash
-export GROQ_API_KEY="your_real_key"
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
 ```
 
-## New backend modules
-
-- `planner_service.py` — parses uploaded syllabus text into topics and
-  spreads them into an adaptive day-by-day schedule ahead of an exam
-  date (harder topics earlier, last day reserved for revision).
-- `health_service.py` — computes a real burnout/stress snapshot from a
-  student's actual scheduled workload, overdue tasks, and agent-query
-  volume (no hardcoded "LOW/OPTIMAL").
-- `analytics_service.py` — derives faculty "doubt clusters" from the
-  actual text of student queries (word/bigram frequency), and a
-  resource-utilization figure from real query and chunk counts.
-
-`main.py` now exposes planner (`/planner/...`), health
-(`/student/health/...`), and richer faculty analytics endpoints on top
-of the original auth/upload/agent-chat routes.
-
-## Frontend
-
-`index.html` is a full rebuild matching the mockup: a landing page,
-sidebar-navigation app shell, and six workspaces — Dashboard, Planner,
-Knowledge Base, Study Hub (multi-agent chat), Health Tracker, and
-Faculty Analytics. It's still a single vanilla-JS/HTML file (no build
-step); it loads Chart.js from a CDN for the workload and stress-trend
-charts, so an internet connection is needed the first time it's opened.
-
-## Running it
+**3. Install dependencies.**
 
 ```bash
 pip install -r requirements.txt
-uvicorn main:app --reload
 ```
 
-Then open `index.html` in a browser (it talks to `http://127.0.0.1:8000`).
+The first install pulls `sentence-transformers` and its embedding model (~100MB) plus `faiss-cpu` — this can take a few minutes the first time. The embedding model is downloaded automatically on the app's first run (needs an internet connection once; it's cached locally after that).
 
-## What's new in this pass
+**4. Configure your environment variables.**
 
-- **Rendering fix:** agent responses were showing raw `**bold**` and
-  `\(LaTeX\)` syntax. Responses are now parsed as Markdown (via
-  marked.js, sanitized with DOMPurify) and math delimiters are rendered
-  with KaTeX — both loaded from a CDN, so an internet connection is
-  needed the first time the page loads.
-- **Download responses:** every agent response in Study Hub has PDF and
-  DOCX buttons. These call new `/export/pdf` and `/export/docx`
-  endpoints (`export_service.py`, using `reportlab` and `python-docx`)
-  and trigger a browser download of the generated file.
-- **Delete documents & accounts:** a ✕ button on each document in the
-  Knowledge Base removes it from FAISS *and* the database
-  (`DELETE /documents/{id}`). A "Delete Account" button in the sidebar
-  wipes a user and everything that references them — tasks, chat
-  history, health snapshots, uploaded documents (and their FAISS
-  chunks), and any communities they created — via `DELETE /users/{id}`.
-  Note: `rag_service.py`'s FAISS index now tracks which chunks belong to
-  which filename so a single document's vectors can be surgically
-  removed without wiping everyone else's.
-- **Faculty task assignment:** the Department Analytics page has an
-  "Assign" button per student and an "Assign Task to All" button, both
-  backed by `POST /faculty/assign-task`. Assigned tasks show up
-  automatically in that student's Planner and Dashboard (they're just
-  `StudyTask` rows with `source="faculty"`).
-- **Communities:** faculty create a community (`POST /communities`) and
-  get a unique 6-digit join code; students join with that code
-  (`POST /communities/join`). Inside a community, faculty can see member
-  progress, assign shared tasks (`POST /communities/{id}/assign-task`),
-  and upload notes (`POST /communities/{id}/notes`) — each note is
-  text-extracted and summarized by the LLM automatically
-  (`rag_engine.summarize_text`), and members can download the original
-  file or read the summary from their side.
+Create a file named `.env` in the project root (same folder as `main.py`):
 
-## Database migrations (Alembic)
+```env
+GROQ_API_KEY=your_real_groq_api_key
+DATABASE_URL=sqlite:///./vidyatech.db
+```
 
-The project now includes an Alembic scaffold (`alembic.ini`,
-`alembic/env.py`) wired to read `DATABASE_URL` the same way the app
-does, so no credentials live in these files either. I couldn't run
-database commands from this environment, so you'll need to run the
-first migration yourself:
+- `GROQ_API_KEY` is **required** — without it, every AI feature (chat, quizzes, summaries, recap, cheat sheets, career tools) will fail.
+- `DATABASE_URL` is optional. If you omit it entirely, the app falls back to a local SQLite file (`vidyatech.db`) automatically — good enough to run the whole project with zero extra setup. To use PostgreSQL instead:
+  ```env
+  DATABASE_URL=postgresql://user:password@localhost:5432/vidyatech_db
+  ```
+  (make sure the database itself already exists — the app/Alembic creates tables, not the database).
+
+`.env` is read automatically at startup (`python-dotenv`) — don't commit it; add it to `.gitignore`.
+
+**5. Create the database tables.**
+
+The simplest path for local/demo use — tables are created automatically the first time the server starts (`init_db()` runs on startup), so you can usually skip straight to step 6.
+
+If you'd rather manage schema changes properly with Alembic (recommended if you'll be editing the models in `database.py`):
 
 ```bash
-# One-time setup, from the project root, with your venv active and
-# DATABASE_URL / .env already set:
-
-# 1. If you already have tables in your DB from running the app before,
-#    generate a migration and mark it as already applied (baseline),
-#    so Alembic doesn't try to recreate existing tables:
+mkdir versions          # one-time: alembic needs this folder to exist
 alembic revision --autogenerate -m "baseline"
-alembic stamp head
+alembic upgrade head
+```
 
-# 2. From now on, whenever you change a model in database.py:
+Whenever you change a model afterward:
+```bash
 alembic revision --autogenerate -m "describe the change"
 alembic upgrade head
 ```
 
-If you're starting from a brand-new empty database instead, skip the
-`stamp head` step — just run `alembic upgrade head` after the first
-`revision --autogenerate` and it'll create everything.
+**6. Run the backend.**
 
-## Bug fixes (this pass)
+```bash
+uvicorn main:app --reload
+```
 
-- **RAG answered off-topic questions using whatever was nearest.**
-  `retrieve_context()` had no relevance cutoff — it always returned the
-  top-k nearest chunks even if none were actually related to the
-  query, and the Summarizer's prompt just said "summarize the
-  context," so asking something unrelated to your uploaded material
-  (e.g. a recipe question against a math PDF) got answered from the
-  math PDF anyway. Fixed with a distance threshold in
-  `rag_service.py` (`RELEVANCE_THRESHOLD`) — queries with no
-  sufficiently close match now correctly fall back to "outside the
-  scope of your uploaded document."
-- **Markdown/LaTeX responses showed raw `**bold**` and `\binom{n}{0}`
-  instead of rendering.** Standard Markdown treats `\(`, `\)`, `\[`,
-  `\]` as *escapable* characters, so running the Markdown parser first
-  silently stripped those backslashes before KaTeX ever saw the
-  delimiters. Fixed in `index.html`'s `renderMarkdown()`: math segments
-  are now extracted and rendered with KaTeX *first*, swapped for
-  plain-text placeholders Markdown can't touch, and substituted back in
-  after Markdown parsing.
+The API is now running at `http://127.0.0.1:8000` (interactive docs at `http://127.0.0.1:8000/docs`).
 
-## New features (this pass)
+**7. Open the frontend.**
 
-All of the below were added as new files/endpoints/views — existing
-code was only touched where the bug fixes above required it.
+Just open `index.html` directly in your browser (double-click it, or right-click → Open With → your browser). It's hardcoded to talk to `http://127.0.0.1:8000`, so make sure the backend from step 6 is running first. An internet connection is needed the first time you load the page (it pulls Chart.js, marked.js, DOMPurify, and KaTeX from a CDN).
 
-1. **Live Syllabus Heatmap & Exam Readiness Score** — `GET
-   /planner/heatmap/{user_id}` scores each of your scheduled topics
-   against how well your uploaded documents actually cover it (via
-   FAISS distance), buckets into 🟢/🟡/🔴, and rolls that into a single
-   Exam Readiness %. Shown on the Planner page.
-2. **60-Second Audio Recap** — `POST /planner/recap` generates a short
-   spoken-style summary of a topic from your notes; the browser's
-   built-in Web Speech API reads it aloud client-side (no TTS backend
-   or audio files needed). Also on the Planner page.
-3. **Proof-of-Understanding Reverse Quiz** — `POST
-   /studyhub/reverse-quiz/prompt` asks you to explain a topic in your
-   own words; `POST /studyhub/reverse-quiz/evaluate` grades your
-   explanation against the source material and returns an accuracy
-   score, missing points, and misconceptions. On the Study Hub page.
-4. **One-Click Cheat Sheet Builder** — `POST /planner/cheatsheet`
-   builds a one-page revision sheet (definitions, formulas, likely exam
-   questions) from your scheduled topics, downloadable as PDF/DOCX via
-   the existing export endpoints. On the Planner page.
-5. **Faculty MCQ Quizzes** — new `Quiz` / `QuizQuestion` /
-   `QuizAssignment` / `QuizSubmission` tables. Faculty generate a quiz
-   from a topic (`POST /quizzes/generate`, AI-authored from the
-   knowledge base), assign it to a department or a specific community
-   (`POST /quizzes/{id}/assign`), and students take it
-   (`GET /quizzes/{id}/take`, `POST /quizzes/{id}/submit` —
-   auto-graded, with correct answers revealed after submission).
-   Faculty see per-student results (`GET /quizzes/{id}/results`). New
-   "Quizzes" nav item for both roles.
+That's it — register an account (choose Student or Faculty), and you're in.
 
-Since new tables were added again (`quizzes`, `quiz_questions`,
-`quiz_assignments`, `quiz_submissions`), the same schema note applies
-as before: use the Alembic commands above, or drop/recreate if you're
-still just testing locally.
+## Project structure
 
-- Swap the email-only login for real password/session auth before any
-  real deployment.
-- The syllabus topic extractor is a heuristic (line/heading based) — it
-  works well on syllabi with one topic per line, less well on dense
-  prose; an LLM-based extraction pass would be more robust if Groq
-  quota allows it.
-- Faculty-only endpoints (`/communities`, `/faculty/assign-task`, etc.)
-  check the caller's role by looking up `faculty_id`/`user_id` in the
-  database — reasonable for a demo without real auth, but not a
-  substitute for actual session-based authorization.
-- Community note files are stored on local disk
-  (`./community_notes/<community_id>/...`) — fine for local use, but
-  swap for object storage (S3, etc.) before deploying anywhere with
-  multiple server instances or ephemeral disks.
+```
+Test4.0/
+├── main.py                    # FastAPI app: all routes wired up here
+├── database.py                # SQLAlchemy models + DB connection/engine
+├── rag_service.py             # FAISS indexing, retrieval, Groq multi-agent chat
+├── planner_service.py         # Syllabus parsing → adaptive schedule
+├── health_service.py          # Burnout/stress snapshot computation
+├── analytics_service.py       # Faculty doubt-cluster & resource analytics
+├── export_service.py          # PDF / DOCX export of AI responses
+├── community_service.py       # Community join-code + membership helpers
+├── heatmap_service.py         # Syllabus coverage heatmap scoring
+├── recap_service.py           # 60-second topic recap generation
+├── reverse_quiz_service.py    # "Explain it back" prompt + grading
+├── cheatsheet_service.py      # One-page revision sheet builder
+├── quiz_service.py            # Faculty MCQ quiz generation/grading
+├── progress_service.py        # Topic mastery / progress tree
+├── career_service.py          # Skill-gap matrix, resume bullets, scholarships
+├── env.py, script.py.mako     # Alembic migration environment
+├── alembic.ini                # Alembic config (reads DATABASE_URL, no secrets)
+├── requirements.txt
+└── index.html                 # Entire frontend (no build step)
+```
+
+## API overview
+
+Full interactive reference is auto-generated at `http://127.0.0.1:8000/docs` once the server is running. Broad groups of endpoints:
+
+- **Auth** — `/register`, `/login`, `DELETE /users/{id}`
+- **Documents / RAG** — `/upload`, `/documents`, `/agent-chat`, `/clear`
+- **Planner** — `/planner/import-syllabus`, `/planner/schedule/{user_id}`, `/planner/tasks`, `/planner/heatmap/{user_id}`, `/planner/recap`, `/planner/cheatsheet`
+- **Study Hub** — `/chat-history/{user_id}`, `/studyhub/reverse-quiz/prompt`, `/studyhub/reverse-quiz/evaluate`, `/export/pdf`, `/export/docx`
+- **Health** — `/student/health/{user_id}`, `/student/health/{user_id}/trend`
+- **Communities** — `/communities`, `/communities/join`, `/communities/{id}`, `/communities/{id}/assign-task`, `/communities/{id}/notes`
+- **Quizzes** — `/quizzes/generate`, `/quizzes/{id}/assign`, `/quizzes/{id}/take`, `/quizzes/{id}/submit`, `/quizzes/{id}/results`
+- **Faculty** — `/faculty/analytics/{department}`, `/faculty/assign-task`
+- **Progress & Career** — `/progress/tree/{user_id}`, `/progress/sprint/start`, `/progress/sprint/grade`, `/career/gap-matrix`, `/career/resume-bullets`, `/career/scholarships`
+
+## Known limitations
+
+- Login is email-only with no password/session mechanism — fine for a local demo, but replace with real authentication before deploying this anywhere public.
+- The syllabus topic extractor is heuristic (line/heading based); dense prose syllabi are parsed less reliably than line-per-topic ones.
+- Faculty-only endpoints check role by looking up the caller's `user_id` in the database rather than a real session/JWT — again, fine for local/demo use only.
+- Community note files are stored on local disk (`./community_notes/...`); swap for object storage (S3, etc.) before running multiple server instances or on ephemeral disks.
+- CORS is currently wide open (`allow_origins=["*"]`) to make local development easy — tighten this before deploying.
+
+## Troubleshooting
+
+- **"Failed to fetch" in the browser / requests hanging** — the backend isn't running, or isn't on port 8000. Check the `uvicorn` terminal for errors.
+- **AI features return errors** — almost always a missing/invalid `GROQ_API_KEY` in `.env`, or the free-tier Groq quota being exhausted.
+- **First request is slow** — the embedding model download/load happens on first use; subsequent requests are fast.
+- **`alembic` command not found / import errors** — make sure your virtual environment is activated before running Alembic commands.
